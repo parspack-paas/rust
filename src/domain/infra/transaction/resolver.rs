@@ -1,0 +1,81 @@
+use crate::{
+    domain::{
+        infra::*,
+        Error,
+    },
+    store::TransactionStore,
+};
+
+#[derive(Clone)]
+pub(in crate::domain) struct TransactionsResolver {
+    transaction_store: Register<TransactionStore>,
+    active_transaction: Register<ActiveTransaction>,
+}
+
+impl Default for TransactionsResolver {
+    fn default() -> Self {
+        TransactionsResolver {
+            transaction_store: Register::once(|_| TransactionStore::new()),
+            active_transaction: Register::factory(|_| {
+                // By default, each call to get an active transaction will receive a fresh one
+                // that isn't transactional at all
+                ActiveTransaction::none()
+            }),
+        }
+    }
+}
+
+impl App {
+    /**
+    Begin a transaction and return a resolver that uses it.
+
+    Any commands that are resolved within the closure will participate in the returned transaction.
+    The transaction will need to be completed before it will commit.
+    */
+    #[emit::span(
+        ok_lvl: "debug",
+        err_lvl: "error",
+        "execute transaction",
+    )]
+    pub async fn transaction<F, O, T, E>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(Resolver) -> O,
+        O: ::std::future::Future<Output = Result<T, E>>,
+        E: ::std::error::Error + Send + Sync + From<Error> + 'static,
+    {
+        let resolver = self
+            .root_resolver
+            .with_active_transaction(Register::once(|resolver| {
+                ActiveTransaction::begin(resolver.transaction_store())
+            }));
+
+        let transaction = resolver.active_transaction();
+        let r = f(resolver).await?;
+        transaction.commit()?;
+
+        Ok(r)
+    }
+}
+
+impl Resolver {
+    pub(in crate::domain) fn transaction_store(&self) -> TransactionStore {
+        self.resolve(&self.transactions_resolver.transaction_store)
+    }
+
+    pub(in crate::domain) fn active_transaction(&self) -> ActiveTransaction {
+        self.resolve(&self.transactions_resolver.active_transaction)
+    }
+
+    pub(in crate::domain) fn with_active_transaction(
+        &self,
+        active_transaction: Register<ActiveTransaction>,
+    ) -> Resolver {
+        Resolver {
+            transactions_resolver: TransactionsResolver {
+                transaction_store: self.transactions_resolver.transaction_store.clone(),
+                active_transaction,
+            },
+            ..self.by_ref()
+        }
+    }
+}
